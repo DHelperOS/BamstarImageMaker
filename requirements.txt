@@ -1,0 +1,6 @@
+google-generativeai
+gradio
+pillow
+python-dotenv
+rembg
+onnxruntime

@@ -1,0 +1,10 @@
+venv/
+.env
+__pycache__/
+*.pyc
+.DS_Store
+images/
+processed_images/
+debug_image_dump.bin
+debug_ref_input.png
+test_output.png
