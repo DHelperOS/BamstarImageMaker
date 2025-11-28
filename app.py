@@ -4,9 +4,114 @@ import google.generativeai as genai
 from PIL import Image
 from dotenv import load_dotenv
 import random
+import torch
+import numpy as np
+from torchvision import transforms
 
 # Load environment variables
 load_dotenv()
+
+# BiRefNet 모델 로드 (최고 성능 배경 제거)
+birefnet_model = None
+birefnet_transform = None
+
+def load_birefnet():
+    """BiRefNet 모델을 로드합니다 (최초 1회만)"""
+    global birefnet_model, birefnet_transform
+    if birefnet_model is None:
+        try:
+            from transformers import AutoModelForImageSegmentation
+            print("BiRefNet 모델 로딩 중...")
+            birefnet_model = AutoModelForImageSegmentation.from_pretrained(
+                'ZhengPeng7/BiRefNet',
+                trust_remote_code=True
+            )
+            # GPU 사용 가능하면 GPU로
+            device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+            birefnet_model = birefnet_model.to(device)
+            birefnet_model.eval()
+
+            birefnet_transform = transforms.Compose([
+                transforms.Resize((1024, 1024)),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            ])
+            print(f"BiRefNet 모델 로드 완료 (device: {device})")
+        except Exception as e:
+            print(f"BiRefNet 로드 실패: {e}")
+            birefnet_model = None
+    return birefnet_model, birefnet_transform
+
+def remove_background_birefnet(image):
+    """BiRefNet을 사용하여 배경을 제거합니다"""
+    model, transform = load_birefnet()
+    if model is None:
+        raise Exception("BiRefNet 모델을 로드할 수 없습니다")
+
+    device = next(model.parameters()).device
+
+    # 원본 크기 저장
+    original_size = image.size
+
+    # RGB로 변환
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+
+    # 전처리
+    input_tensor = transform(image).unsqueeze(0).to(device)
+
+    # 추론
+    with torch.no_grad():
+        preds = model(input_tensor)[-1].sigmoid()
+
+    # 마스크 후처리
+    pred = preds[0].squeeze()
+    pred_np = pred.cpu().numpy()
+
+    # 원본 크기로 리사이즈
+    mask = Image.fromarray((pred_np * 255).astype(np.uint8))
+    mask = mask.resize(original_size, Image.LANCZOS)
+
+    # RGBA 이미지 생성
+    image_rgba = image.convert('RGBA')
+    image_rgba.putalpha(mask)
+
+    return image_rgba
+
+def remove_background_inspyrenet(image):
+    """InSPyReNet (transparent-background)을 사용하여 배경을 제거합니다"""
+    from transparent_background import Remover
+    remover = Remover()
+
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+
+    out = remover.process(image)
+    return Image.fromarray(out)
+
+def remove_background_rembg(image, model_name="u2net"):
+    """rembg를 사용하여 배경을 제거합니다 (기존 방식)"""
+    from rembg import remove, new_session
+    session = new_session(model_name)
+    return remove(image, session=session)
+
+def smart_remove_background(image, model_choice="BiRefNet (최고 성능)"):
+    """선택된 모델로 배경을 제거합니다"""
+    if "BiRefNet" in model_choice:
+        return remove_background_birefnet(image)
+    elif "InSPyReNet" in model_choice:
+        return remove_background_inspyrenet(image)
+    else:
+        # rembg 모델들
+        model_map = {
+            "u2net": "u2net",
+            "isnet-general-use": "isnet-general-use",
+            "u2net_human_seg": "u2net_human_seg",
+        }
+        for key, val in model_map.items():
+            if key in model_choice:
+                return remove_background_rembg(image, val)
+        return remove_background_rembg(image, "u2net")
 
 # Configure Gemini API
 api_key = os.getenv("GOOGLE_API_KEY")
@@ -182,15 +287,13 @@ def generate_image(ref_image, character, color_option, count, custom_keyword, si
 
         # Background Removal & Smart Crop Logic
         try:
-            from rembg import remove
-            
             if size_option == "512x512":
                 debug_log.append("Option 512x512 selected. Starting Smart Crop Workflow.")
-                
-                # 1. Remove Background from Original High-Res Image
-                debug_log.append("Removing background from original image...")
-                no_bg_image = remove(generated_image)
-                debug_log.append("Background removed.")
+
+                # 1. Remove Background from Original High-Res Image (BiRefNet 사용)
+                debug_log.append("Removing background with BiRefNet (SOTA model)...")
+                no_bg_image = smart_remove_background(generated_image, "BiRefNet (최고 성능)")
+                debug_log.append("Background removed with BiRefNet.")
                 
                 # 2. Smart Crop (Crop to Content)
                 bbox = no_bg_image.getbbox()
@@ -224,9 +327,9 @@ def generate_image(ref_image, character, color_option, count, custom_keyword, si
                 
             else:
                 # 1:1 Option: Just remove background from original
-                debug_log.append("Option 1:1 selected. Removing background only.")
-                final_image = remove(generated_image)
-                debug_log.append("Background removed.")
+                debug_log.append("Option 1:1 selected. Removing background with BiRefNet...")
+                final_image = smart_remove_background(generated_image, "BiRefNet (최고 성능)")
+                debug_log.append("Background removed with BiRefNet.")
 
         except Exception as bg_err:
             debug_log.append(f"Background removal or smart crop failed: {bg_err}")
@@ -268,41 +371,56 @@ def set_as_reference(image):
         outputs=ref_image
     )
 
-def process_uploaded_image(files):
+def process_uploaded_image(files, model_name):
     """
-    Manually process uploaded images: Rembg -> Smart Crop -> Resize to 512x512 -> WebP
-    Supports batch processing.
+    Manually process uploaded images: Background Removal -> Smart Crop -> Resize to 512x512 -> WebP
+    Supports batch processing and model selection.
+    Now supports BiRefNet (SOTA) and InSPyReNet for better quality.
     """
     if not files:
         return None, "이미지를 업로드해주세요."
-    
+
     processed_images = []
     full_log = []
-    
-    # Ensure files is a list (Gradio might pass a single file object if not configured right, but with file_count='multiple' it sends a list)
+
+    # Ensure files is a list
     if not isinstance(files, list):
         files = [files]
 
-    from rembg import remove
-    import os
     from datetime import datetime
 
     save_dir = "processed_images"
     os.makedirs(save_dir, exist_ok=True)
 
+    # 모델 로딩
+    full_log.append(f"모델 로딩 중: {model_name}...")
+
+    # BiRefNet 사전 로딩 (첫 이미지 처리 전)
+    if "BiRefNet" in model_name:
+        try:
+            load_birefnet()
+            full_log.append("BiRefNet 모델 로드 완료 (SOTA 품질)")
+        except Exception as e:
+            full_log.append(f"BiRefNet 로드 실패: {e}, rembg로 폴백합니다.")
+            model_name = "u2net"
+
     for idx, file_obj in enumerate(files):
         try:
-            # file_obj is a NamedString or similar in newer Gradio, or just path string
-            # In Gradio 3.x/4.x with type="filepath", it's a path string.
-            file_path = file_obj.name if hasattr(file_obj, 'name') else file_obj
-            
+            # Gradio File 객체 처리 - 문자열(경로) 또는 객체
+            if isinstance(file_obj, str):
+                file_path = file_obj
+            elif hasattr(file_obj, 'name'):
+                file_path = file_obj.name
+            else:
+                file_path = str(file_obj)
+
             full_log.append(f"--- 이미지 {idx+1}/{len(files)} 처리 시작: {os.path.basename(file_path)} ---")
-            
+
             input_image = Image.open(file_path)
-            
+
             # 1. Remove Background
-            full_log.append("1. 배경 제거 중...")
-            no_bg_image = remove(input_image)
+            full_log.append(f"1. 배경 제거 중 ({model_name})...")
+            no_bg_image = smart_remove_background(input_image, model_name)
             
             # 2. Smart Crop
             full_log.append("2. 스마트 크롭 중...")
@@ -333,7 +451,7 @@ def process_uploaded_image(files):
             save_path = os.path.join(save_dir, filename)
             final_image.save(save_path, format="WEBP")
             
-            processed_images.append(save_path) # Return path for Gallery
+            processed_images.append(save_path)
             full_log.append(f"완료: {filename}")
             
         except Exception as e:
@@ -398,21 +516,42 @@ with gr.Blocks(title="Bamstar Image Maker") as demo:
         )
 
     with gr.Tab("이미지 후처리 (Post-processing)"):
-        gr.Markdown("### 이미지 배경 제거 및 스마트 크롭 (Rembg -> Crop -> Resize 512x512)")
+        gr.Markdown("### 이미지 배경 제거 및 스마트 크롭 (BiRefNet/InSPyReNet -> Crop -> Resize 512x512)")
         gr.Markdown("여러 장의 이미지를 한 번에 업로드하여 처리할 수 있습니다.")
+
         with gr.Row():
             with gr.Column():
-                proc_input = gr.File(file_count="multiple", type="filepath", label="이미지 업로드 (다중 선택 가능)")
+                # Use gr.File for direct file input
+                proc_input = gr.File(
+                    label="이미지 업로드 (Drag & Drop or Click)",
+                    file_count="multiple",
+                    file_types=["image"]
+                )
+
+                model_option = gr.Dropdown(
+                    [
+                        "BiRefNet (최고 성능 - SOTA 2024)",
+                        "InSPyReNet (빠르고 안정적)",
+                        "u2net (rembg 기본)",
+                        "isnet-general-use (rembg)",
+                        "u2net_human_seg (rembg 인물용)"
+                    ],
+                    label="배경 제거 모델 선택 (Model)",
+                    value="BiRefNet (최고 성능 - SOTA 2024)",
+                    info="BiRefNet: 2024 최신 SOTA 모델, 가장 정확한 누끼. InSPyReNet: 빠르고 안정적."
+                )
+
                 proc_btn = gr.Button("일괄 처리 시작 (Batch Process)", variant="primary")
+
             with gr.Column():
                 proc_output = gr.Gallery(label="결과 이미지 (Results)", columns=3)
                 proc_log = gr.Textbox(label="처리 로그 (Process Log)", lines=10)
-                
+
         proc_btn.click(
             fn=process_uploaded_image,
-            inputs=proc_input,
+            inputs=[proc_input, model_option],
             outputs=[proc_output, proc_log]
         )
 
 if __name__ == "__main__":
-    demo.launch(share=True)
+    demo.launch(share=True, show_api=False)
